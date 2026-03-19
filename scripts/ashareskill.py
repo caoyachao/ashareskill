@@ -70,6 +70,34 @@ class AShareSkill:
             bs.logout()
             print("[AShareSkill] 已登出BaoStock")
     
+    def _ensure_login(self, max_retries=3):
+        """确保已登录BaoStock，如果未登录或会话过期则重新登录"""
+        for attempt in range(max_retries):
+            try:
+                # 检查登录状态
+                if self.lg is None or self.lg.error_code != '0':
+                    print(f"[AShareSkill] 会话失效，重新登录 (尝试 {attempt + 1}/{max_retries})...")
+                    self._login()
+                
+                # 测试登录状态是否有效
+                test_rs = bs.query_trade_dates(start_date="2026-03-01", end_date="2026-03-02")
+                if test_rs.error_code == '0':
+                    return True
+                else:
+                    print(f"[AShareSkill] 会话测试失败，重新登录...")
+                    self._login()
+                    return True
+                    
+            except Exception as e:
+                print(f"[AShareSkill] 登录检查失败: {e}")
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(1)
+                else:
+                    raise ConnectionError(f"无法连接到BaoStock: {e}")
+        
+        return False
+    
     def _init_stock_list(self):
         """初始化股票列表缓存"""
         try:
@@ -219,12 +247,13 @@ class AShareSkill:
             print(f"[AShareSkill] 请使用更精确的名称或代码")
             return None
     
-    def get_index_components(self, index_code: str) -> List[str]:
+    def get_index_components(self, index_code: str, max_retries: int = 3) -> List[str]:
         """
         获取指数成分股列表
         
         Args:
             index_code: 指数代码（如 000905 中证500，000300 沪深300）
+            max_retries: 最大重试次数
             
         Returns:
             成分股代码列表
@@ -239,37 +268,60 @@ class AShareSkill:
         
         print(f"[AShareSkill] 正在获取 {index_code} 的成分股列表...")
         
-        # 使用query_stock_industry或query_all_stock获取成分股
-        # BaoStock没有直接的指数成分股查询，使用query_stock_industry替代
-        try:
-            # 获取特定日期
-            today = datetime.now()
-            for i in range(10):
-                date_str = (today - timedelta(days=i)).strftime("%Y-%m-%d")
+        # 尝试获取成分股（带重试）
+        for attempt in range(max_retries):
+            try:
+                # 确保登录
+                self._ensure_login()
                 
-                # 尝试获取指数成分股
-                rs = bs.query_zz500_stocks(date=date_str) if '000905' in index_code else \
-                     bs.query_hs300_stocks(date=date_str) if '000300' in index_code else \
-                     bs.query_sz50_stocks(date=date_str) if '000016' in index_code else None
-                
-                if rs is None:
-                    print(f"[AShareSkill] ! 暂不支持该指数的成分股查询: {index_code}")
-                    return []
-                
-                stocks = []
-                while (rs.error_code == '0') & rs.next():
-                    row = rs.get_row_data()
-                    if len(row) > 1:
-                        stocks.append(row[1])  # 成分股代码
-                
-                if len(stocks) > 0:
-                    print(f"[AShareSkill]   ✓ 获取到 {len(stocks)} 只成分股（日期: {date_str}）")
-                    return stocks
+                # 获取特定日期
+                today = datetime.now()
+                for i in range(10):
+                    date_str = (today - timedelta(days=i)).strftime("%Y-%m-%d")
                     
-        except Exception as e:
-            print(f"[AShareSkill] ✗ 获取成分股失败: {e}")
-            return []
+                    # 尝试获取指数成分股
+                    if '000905' in index_code:
+                        rs = bs.query_zz500_stocks(date=date_str)
+                    elif '000300' in index_code:
+                        rs = bs.query_hs300_stocks(date=date_str)
+                    elif '000016' in index_code:
+                        rs = bs.query_sz50_stocks(date=date_str)
+                    else:
+                        print(f"[AShareSkill] ! 暂不支持该指数的成分股查询: {index_code}")
+                        return []
+                    
+                    if rs.error_code != '0':
+                        if "用户未登录" in str(rs.error_msg) and attempt < max_retries - 1:
+                            print(f"[AShareSkill]   登录失效，重新登录后重试...")
+                            self._login()
+                            break  # 跳出内层循环，重试外层
+                        print(f"[AShareSkill]   ✗ 查询失败: {rs.error_msg}")
+                        return []
+                    
+                    stocks = []
+                    while (rs.error_code == '0') & rs.next():
+                        row = rs.get_row_data()
+                        if len(row) > 1:
+                            stocks.append(row[1])  # 成分股代码
+                    
+                    if len(stocks) > 0:
+                        print(f"[AShareSkill]   ✓ 获取到 {len(stocks)} 只成分股（日期: {date_str}）")
+                        return stocks
+                
+                # 如果内层循环完成但没有返回，说明该日期没有数据，继续外层重试
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(0.5)
+                    
+            except Exception as e:
+                print(f"[AShareSkill] ✗ 获取成分股失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(1)
+                else:
+                    return []
         
+        print(f"[AShareSkill] ! 未找到成分股数据")
         return []
     
     def resolve_stock_codes(self, stock_input: Union[str, List[str]]) -> List[str]:
@@ -341,12 +393,11 @@ class AShareSkill:
         print(f"[AShareSkill] 正在获取 {stock_name or stock_code} 的{frequency}数据...")
         print(f"[AShareSkill]   时间范围: {start_date} ~ {end_date}")
         
-        # 确保已登录
-        if self.lg is None or self.lg.error_code != '0':
-            self._login()
+        # 确保已登录（带重试机制）
+        self._ensure_login()
         
-        # 获取K线数据
-        kline_df = self._query_kline(stock_code, start_date, end_date, freq, adjust)
+        # 获取K线数据（带重试）
+        kline_df = self._query_kline_with_retry(stock_code, start_date, end_date, freq, adjust)
         if len(kline_df) == 0:
             return pd.DataFrame()
         
@@ -392,37 +443,61 @@ class AShareSkill:
         
         return result_df
     
+    def _query_kline_with_retry(self, stock_code: str, start_date: str, end_date: str, 
+                                frequency: str, adjustflag: str, max_retries: int = 3) -> pd.DataFrame:
+        """查询K线基础数据（带重试机制）"""
+        for attempt in range(max_retries):
+            try:
+                # 确保登录
+                self._ensure_login()
+                
+                # 月线查询不支持preclose字段
+                if frequency in ['w', 'm']:
+                    fields = "date,open,high,low,close,volume,amount,turn,pctChg"
+                else:
+                    fields = "date,open,high,low,close,preclose,volume,amount,turn,pctChg,isST"
+                
+                rs = bs.query_history_k_data_plus(
+                    stock_code,
+                    fields,
+                    start_date=start_date,
+                    end_date=end_date,
+                    frequency=frequency,
+                    adjustflag=adjustflag
+                )
+                
+                if rs.error_code != '0':
+                    if "用户未登录" in str(rs.error_msg) and attempt < max_retries - 1:
+                        print(f"[AShareSkill]   登录失效，重新登录后重试...")
+                        self._login()
+                        continue
+                    print(f"[AShareSkill]   ✗ K线数据查询失败: {rs.error_msg}")
+                    return pd.DataFrame()
+                
+                data_list = []
+                while (rs.error_code == '0') & rs.next():
+                    data_list.append(rs.get_row_data())
+                
+                if len(data_list) == 0:
+                    return pd.DataFrame()
+                
+                df = pd.DataFrame(data_list, columns=rs.fields)
+                return df
+                
+            except Exception as e:
+                print(f"[AShareSkill]   查询异常 (尝试 {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(1)
+                else:
+                    return pd.DataFrame()
+        
+        return pd.DataFrame()
+    
     def _query_kline(self, stock_code: str, start_date: str, end_date: str, 
                      frequency: str, adjustflag: str) -> pd.DataFrame:
-        """查询K线基础数据"""
-        # 月线查询不支持preclose字段
-        if frequency in ['w', 'm']:
-            fields = "date,open,high,low,close,volume,amount,turn,pctChg"
-        else:
-            fields = "date,open,high,low,close,preclose,volume,amount,turn,pctChg,isST"
-        
-        rs = bs.query_history_k_data_plus(
-            stock_code,
-            fields,
-            start_date=start_date,
-            end_date=end_date,
-            frequency=frequency,
-            adjustflag=adjustflag
-        )
-        
-        if rs.error_code != '0':
-            print(f"[AShareSkill]   ✗ K线数据查询失败: {rs.error_msg}")
-            return pd.DataFrame()
-        
-        data_list = []
-        while (rs.error_code == '0') & rs.next():
-            data_list.append(rs.get_row_data())
-        
-        if len(data_list) == 0:
-            return pd.DataFrame()
-        
-        df = pd.DataFrame(data_list, columns=rs.fields)
-        return df
+        """查询K线基础数据（兼容旧方法，实际调用带重试版本）"""
+        return self._query_kline_with_retry(stock_code, start_date, end_date, frequency, adjustflag)
     
     def _query_indicators(self, stock_code: str, start_date: str, end_date: str,
                           frequency: str, adjustflag: str) -> pd.DataFrame:
@@ -583,6 +658,9 @@ class AShareSkill:
         Returns:
             合并后的DataFrame
         """
+        # 确保登录状态
+        self._ensure_login()
+        
         codes = self.resolve_stock_codes(stock_list)
         
         if len(codes) == 0:
